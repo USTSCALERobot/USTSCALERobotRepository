@@ -1,0 +1,3 @@
+[submodule "basic_pipelines/Final"]
+	path = basic_pipelines/Final
+	url = https://github.com/USTSCALERobot/Final.git
