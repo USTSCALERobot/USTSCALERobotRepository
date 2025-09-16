@@ -1,0 +1,12 @@
+Angle used for deskew: 12.29 degrees
+Upscaling from (160 x 105) to (320 x 210)
+Upscaled deskewed image saved to: /home/scalepi/Desktop/OCR/deskewed_upscaled.png
+Traceback (most recent call last):
+  File "/home/scalepi/hailo-rpi5-examples/basic_pipelines/Final/ocr.py", line 287, in <module>
+    main()
+  File "/home/scalepi/hailo-rpi5-examples/basic_pipelines/Final/ocr.py", line 262, in main
+    best_threshold, thresh_img, thresh_text, thresh_score = dynamic_thresholding_with_offset(
+                                                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: dynamic_thresholding_with_offset() got an unexpected keyword argument 'tol'
+❌ OCR processing failed with return code 1
+❌ OCR Handler failed with return code 1

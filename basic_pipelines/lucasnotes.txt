@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+import os
+import sys
+import cv2
+import numpy as np
+from datetime import datetime
+import pytesseract
+from difflib import SequenceMatcher
+import gc
+import easyocr
+
+# Paths (adjust as needed)
+DETECTION_FILE = "/home/scalepi/Desktop/savephototest/latest_detection.txt"
+SAVE_FOLDER = "/home/scalepi/Desktop/OCR"
+
+# Define output file paths (within the save folder)
+final_thresholded_output_path = os.path.join(SAVE_FOLDER, "deskewed.png")
+deskewed_flipped_path = os.path.join(SAVE_FOLDER, "deskewed_flipped.png")
+upscaled_path = os.path.join(SAVE_FOLDER, "deskewed_upscaled.png")
+dynamic_thresholded_output_path = os.path.join(SAVE_FOLDER, "dynamic_thresholded.png")
+ocr_overlay_output_path = os.path.join(SAVE_FOLDER, "ocr_text_overlay.png")
+
+# Hardcoded known part numbers for matching
+known_part_numbers = ["SN74LS03J", "LM474", "SN84H203", "S", "LM7456Huehosfnsdok"]
+
+# -----------------------------
+# Helper: Read Detection File
+# -----------------------------
+def read_detection_file():
+    if not os.path.exists(DETECTION_FILE):
+        sys.exit(f"Detection file not found: {DETECTION_FILE}")
+    with open(DETECTION_FILE, "r") as f:
+        line = f.read().strip()
+    if not line:
+        sys.exit("Detection file is empty.")
+    data = line.split(",")
+    if len(data) < 6:
+        sys.exit("Detection file format error. Expected at least 6 comma-separated values.")
+    full_image_path = data[0]
+    try:
+        x1_norm = float(data[2])
+        y1_norm = float(data[3])
+        x2_norm = float(data[4])
+        y2_norm = float(data[5])
+    except ValueError:
+        sys.exit("Error parsing bbox coordinates from detection file.")
+    return full_image_path, (x1_norm, y1_norm, x2_norm, y2_norm)
+
+# -----------------------------
+# Helper: Load & Fix Orientation
+# -----------------------------
+def load_and_fix_orientation(image_path):
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        sys.exit(f"Could not load image from: {image_path}")
+    print(f"Loaded image shape: {img.shape}")
+    if img.shape[0] > img.shape[1]:
+        print("Image is in portrait orientation; rotating 90° clockwise.")
+        img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    return img
+
+# -----------------------------
+# Helper: Crop Image by BBox
+# -----------------------------
+def crop_image_by_bbox(image, bbox_norm):
+    (x1_norm, y1_norm, x2_norm, y2_norm) = bbox_norm
+    h, w = image.shape[:2]
+    x1 = int(x1_norm * w)
+    y1 = int(y1_norm * h)
+    x2 = int(x2_norm * w)
+    y2 = int(y2_norm * h)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        sys.exit("Invalid bbox: x2 <= x1 or y2 <= y1.")
+    cropped = image[y1:y2, x1:x2]
+    print(f"Cropped image shape (from bbox): {(x2 - x1)} x {(y2 - y1)}")
+    return cropped
+
+# -----------------------------
+# Helper: Remove Background via Blob Detection
+# -----------------------------
+def remove_background(image):
+    _, binary = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        print("No contours found; returning original image.")
+        return image, None
+    largest_contour = max(contours, key=cv2.contourArea)
+    mask = np.zeros_like(image)
+    cv2.drawContours(mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+    result = np.where(mask == 255, image, 255).astype(np.uint8)
+    print("Background removed using blob detection mask.")
+    return result, largest_contour
+
+# -----------------------------
+# Helper: Upscale Image
+# -----------------------------
+def upscale_image(image, scale=2):
+    height, width = image.shape[:2]
+    new_w = int(width * scale)
+    new_h = int(height * scale)
+    print(f"Upscaling from ({width} x {height}) to ({new_w} x {new_h})")
+    upscaled = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    return upscaled
+
+# -----------------------------
+# Helper: Dynamic Thresholding with Offset Check using pytesseract
+# -----------------------------
+def dynamic_thresholding_coarse_to_fine(image, low=0, high=255, coarse_step=20, fine_step=5):
+    """
+    Uses a coarse-to-fine search to determine the best threshold.
+    First, it scans the threshold range in coarse_step increments.
+    Then, it refines upward and downward in fine_step increments until
+    no further improvement in OCR similarity is observed.
+    
+    Returns:
+        best_threshold (int): The threshold value that yields the highest similarity.
+        best_image (ndarray): The thresholded (inverted) image at that threshold.
+        best_text (str): The OCR text produced at that threshold.
+        best_score (float): The similarity score (0-100) from evaluate_ocr_text.
+    """
+    # Custom pytesseract configuration (using PSM 7 and a whitelist)
+    custom_config = r'--psm 7 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+    
+    best_threshold = low
+    best_score = -1.0
+    best_text = ""
+    best_image = None
+    
+    # Coarse search over the range using the coarse_step.
+    for thresh_val in range(low, high + 1, coarse_step):
+        ret, binary = cv2.threshold(image, thresh_val, 255, cv2.THRESH_BINARY)
+        inverted = cv2.bitwise_not(binary)
+        text = pytesseract.image_to_string(inverted, config=custom_config)
+        # Evaluate OCR text similarity against known part numbers.
+        _, similarity = evaluate_ocr_text(text, known_part_numbers)
+        if similarity > best_score:
+            best_score = similarity
+            best_threshold = thresh_val
+            best_text = text
+            best_image = inverted
+    print(f"Coarse search: best_threshold = {best_threshold}, similarity = {best_score:.2f}%")
+    
+    # Fine search upward (increasing threshold)
+    current_threshold = best_threshold
+    current_score = best_score
+    while current_threshold + fine_step <= high:
+        test_thresh = current_threshold + fine_step
+        ret, binary = cv2.threshold(image, test_thresh, 255, cv2.THRESH_BINARY)
+        inverted = cv2.bitwise_not(binary)
+        text = pytesseract.image_to_string(inverted, config=custom_config)
+        _, similarity = evaluate_ocr_text(text, known_part_numbers)
+        if similarity > current_score:
+            current_score = similarity
+            current_threshold = test_thresh
+            best_score = similarity
+            best_threshold = test_thresh
+            best_text = text
+            best_image = inverted
+        else:
+            break  # Stop upward search if similarity decreases
+    # Fine search downward (decreasing threshold)
+    current_threshold = best_threshold
+    current_score = best_score
+    while current_threshold - fine_step >= low:
+        test_thresh = current_threshold - fine_step
+        ret, binary = cv2.threshold(image, test_thresh, 255, cv2.THRESH_BINARY)
+        inverted = cv2.bitwise_not(binary)
+        text = pytesseract.image_to_string(inverted, config=custom_config)
+        _, similarity = evaluate_ocr_text(text, known_part_numbers)
+        if similarity > current_score:
+            current_score = similarity
+            current_threshold = test_thresh
+            best_score = similarity
+            best_threshold = test_thresh
+            best_text = text
+            best_image = inverted
+        else:
+            break  # Stop downward search if similarity decreases
+            
+    print(f"Fine search result: best_threshold = {best_threshold}, best_score = {best_score:.2f}%")
+    return best_threshold, best_image, best_text, best_score
+# -----------------------------
+# Helper: Deskew the Image using Chip Contour
+# -----------------------------
+def deskew_image(image, contour):
+    rect = cv2.minAreaRect(contour)
+    (cx, cy), (rw, rh), angle = rect
+    if rw < rh:
+        rw, rh = rh, rw
+        angle += 90.0
+    print(f"minAreaRect: center=({cx:.2f},{cy:.2f}), size=({rw:.2f}x{rh:.2f}), angle={angle:.2f}°")
+    (h, w) = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    deskewed = cv2.warpAffine(image, M, (w, h),
+                              flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=255)
+    return deskewed, angle
+
+# -----------------------------
+# Helper: Evaluate OCR Text against Known Parts
+# -----------------------------
+def evaluate_ocr_text(ocr_text, known_parts):
+    best_match = "No match found"
+    best_score = 0.0
+    for part in known_parts:
+        score = SequenceMatcher(None, ocr_text, part).ratio()
+        if score > best_score:
+            best_score = score
+            best_match = part
+    return best_match, best_score * 100
+
+# -----------------------------
+# New Helper: Draw EasyOCR Results (Bounding Boxes & Text)
+# -----------------------------
+def draw_easyocr_results(image, results, output_path):
+    # Ensure image is in color for drawing
+    if len(image.shape) == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    for (bbox, text, conf) in results:
+        pts = np.array(bbox, np.int32).reshape((-1, 1, 2))
+        cv2.polylines(image, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+        tl = (int(bbox[0][0]), int(bbox[0][1]))
+        cv2.putText(image, text, (tl[0], tl[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    cv2.imwrite(output_path, image)
+    print(f"EasyOCR result overlay saved to: {output_path}")
+
+# -----------------------------
+# Main OCR Pipeline
+# -----------------------------
+def main():
+    # 1. Read detection file
+    full_image_path, bbox_norm = read_detection_file()
+    print(f"Full image path: {full_image_path}")
+    print(f"Normalized bbox: {bbox_norm}")
+    
+    # 2. Load full image and fix orientation
+    img_gray = load_and_fix_orientation(full_image_path)
+    
+    # 3. Crop image by detection bbox
+    cropped_img = crop_image_by_bbox(img_gray, bbox_norm)
+    
+    # 4. Remove background from cropped image
+    img_bg_removed, chip_contour = remove_background(cropped_img)
+    os.makedirs(SAVE_FOLDER, exist_ok=True)
+    bg_removed_path = os.path.join(SAVE_FOLDER, "bg_removed.png")
+    cv2.imwrite(bg_removed_path, img_bg_removed)
+    print(f"Background-removed image saved to: {bg_removed_path}")
+    
+    # 5. Outline the largest contour for debugging
+    if chip_contour is not None:
+        outlined = cv2.cvtColor(img_bg_removed, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(outlined, [chip_contour], -1, (0, 255, 0), 2)
+        outlined_path = os.path.join(SAVE_FOLDER, "outlined_bg_removed.png")
+        cv2.imwrite(outlined_path, outlined)
+        print(f"Outlined background-removed image saved to: {outlined_path}")
+    else:
+        sys.exit("No chip contour detected. Exiting.")
+    
+    # 6. Deskew the background-removed image using the chip contour
+    deskewed, angle_used = deskew_image(img_bg_removed, chip_contour)
+    
+    # 7. Produce a flipped version of the deskewed image (rotate 180°)
+    deskewed_flipped = cv2.rotate(deskewed, cv2.ROTATE_180)
+    
+    # 8. Save the deskewed images and print the angle
+    deskewed_path = os.path.join(SAVE_FOLDER, "deskewed.png")
+    deskewed_flipped_path = os.path.join(SAVE_FOLDER, "deskewed_flipped.png")
+    cv2.imwrite(deskewed_path, deskewed)
+    cv2.imwrite(deskewed_flipped_path, deskewed_flipped)
+    print(f"Deskewed image saved to: {deskewed_path}")
+    print(f"Deskewed & flipped image saved to: {deskewed_flipped_path}")
+    print(f"Angle used for deskew: {angle_used:.2f} degrees")
+    
+    # 9. Upscale the deskewed image BEFORE dynamic thresholding
+    upscaled = upscale_image(deskewed, scale=2)
+    upscaled_path = os.path.join(SAVE_FOLDER, "deskewed_upscaled.png")
+    cv2.imwrite(upscaled_path, upscaled)
+    print(f"Upscaled deskewed image saved to: {upscaled_path}")
+    
+    # 10. Apply dynamic thresholding with offset on the upscaled image
+    # 10. Apply dynamic thresholding with our new coarse-to-fine search on the upscaled image
+    best_threshold, thresh_img, thresh_text, thresh_score = dynamic_thresholding_coarse_to_fine(
+        upscaled, low=0, high=255, coarse_step=20, fine_step=5
+    )
+    cv2.imwrite(dynamic_thresholded_output_path, thresh_img)
+    print(f"Dynamic thresholded image saved to: {dynamic_thresholded_output_path}")
+    print(f"Best dynamic threshold: {best_threshold} (Score: {thresh_score})")
+    
+    # 11. Run EasyOCR on the dynamic thresholded image (final OCR)
+    ocr_reader = easyocr.Reader(['en'], gpu=False)
+    ocr_results = ocr_reader.readtext(thresh_img)
+    easyocr_text = " ".join([res[1] for res in ocr_results])
+    print("\nEasyOCR Results:")
+    print(easyocr_text)
+    
+    # 12. Compare the OCR text from EasyOCR to the known part numbers
+    best_match, similarity = evaluate_ocr_text(easyocr_text, known_part_numbers)
+    print("\nFinal OCR Evaluation:")
+    print(f"EasyOCR Text: {easyocr_text}")
+    print(f"Closest Part Number: {best_match}")
+    print(f"Similarity: {similarity:.2f}%")
+    
+    # 13. Draw EasyOCR bounding boxes on the dynamic thresholded image
+    draw_easyocr_results(thresh_img, ocr_results, ocr_overlay_output_path)
+
+if __name__ == "__main__":
+    main()

@@ -24,36 +24,37 @@ from hailo_rpi_common import (
     dummy_callback,
 )
 
-# -----------------------------------------------------------------------------------------------
-# User Gstreamer Application
-# -----------------------------------------------------------------------------------------------
-
-# This class inherits from the hailo_rpi_common.GStreamerApp class
 class GStreamerDetectionApp(GStreamerApp):
     def __init__(self, app_callback, user_data):
         parser = get_default_parser()
+        
         # Add additional arguments here
         parser.add_argument(
             "--network",
-            default="yolov6n",
+            default="yolov8s",
             choices=['yolov6n', 'yolov8s'],
             help="Which Network to use, default is yolov6n",
         )
         parser.add_argument(
             "--hef-path",
-            default="resources/Final.hef",
+            #default="resources/Final.hef",
+            default="resources/chip.hef",
             help="Path to HEF file",
         )
         parser.add_argument(
             "--labels-json",
-            default=None,
+            #default="resources/Final.json",
+            default="default",
             help="Path to costume labels JSON file",
         )
+
         args = parser.parse_args()
+
         # Call the parent class constructor
         super().__init__(args, user_data)
+
         # Additional initialization code can be added here
-        # Set Hailo parameters these parameters should be set based on the model used
+        # Set Hailo parameters based on the model used
         self.batch_size = 2
         self.network_width = 640
         self.network_height = 640
@@ -62,8 +63,7 @@ class GStreamerDetectionApp(GStreamerApp):
         nms_iou_threshold = 0.45
 
         if args.hef_path is not None:
-            self.hef_path = args.hef_path
-        # Set the HEF file path based on the network
+            self.hef_path = args.hef_path  # Use provided HEF path
         elif args.network == "yolov6n":
             self.hef_path = os.path.join(self.current_path, '../resources/yolov6n.hef')
         elif args.network == "yolov8s":
@@ -85,47 +85,36 @@ class GStreamerDetectionApp(GStreamerApp):
         # Set the process title
         setproctitle.setproctitle("IC Object Detection")
 
+        # Create the pipeline
         self.create_pipeline()
 
     def get_pipeline_string(self):
         source_pipeline = SOURCE_PIPELINE(self.video_source)
-        
-        tee_element = "tee name=tee"
-        queue_element = "queue max-size-buffers=10"
-        sink_element = "appsink name=raw_sink"
-
-        pipeline_string = f"{source_pipeline} ! {tee_element} ! {queue_element} ! {sink_element}"
-
-# In your probe, connect to `raw_sink` and push frames into the `raw_frame_queue`
-
-        detection_pipeline = DETECTION_PIPELINE(hef_path=self.hef_path, batch_size=self.batch_size, labels_json=self.labels_json, additional_params=self.thresholds_str)
+        detection_pipeline = DETECTION_PIPELINE(
+            hef_path=self.hef_path,
+            batch_size=self.batch_size,
+            labels_json=self.labels_json,
+            additional_params=self.thresholds_str
+        )
         user_callback_pipeline = USER_CALLBACK_PIPELINE()
         display_pipeline = DISPLAY_PIPELINE(video_sink=self.video_sink, sync=self.sync, show_fps=False)
+        
         pipeline_string = (
             f'{source_pipeline} '
-            f'{detection_pipeline} ! '
+            f'! tee name=t '
+            f't. {detection_pipeline} ! '
             f'{user_callback_pipeline} ! '
-            f'{display_pipeline}'
+            f'{display_pipeline} '
+            f't. ! queue ! appsink name=framesink'
         )
         print(pipeline_string)
         return pipeline_string
-   
-    def save_frames(self):
-        while True:
-            try:
-                frame_number, frame = self.raw_frame_queue.get(timeout=1)
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                frame_path = f"raw_frame_{frame_number}.png"
-                cv2.imwrite(frame_path, frame_bgr)
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"Error saving frame: {e}")
 
 if __name__ == "__main__":
     # Create an instance of the user app callback class
-    user_data = app_callback_class()
-    app_callback = dummy_callback
-    app = GStreamerDetectionApp(app_callback, user_data)
-    app.run()
+    user_data = user_app_callback_class()
 
+    # Start the separate process for saving frames
+    save_path = '/home/scalepi/hailo-rpi5-examples/OCR Images'
+    frame_saver_process = multiprocessing.Process(target=save_frames, args=(user_data.raw_frame_queue, save_path))
+    frame_saver_process.start()

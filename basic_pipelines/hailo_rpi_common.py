@@ -86,6 +86,7 @@ def display_user_data_frame(user_data: app_callback_class):
         frame = user_data.get_frame()
         if frame is not None:
             cv2.imshow("User Frame", frame)
+            cv2.imwrite('Frame.jpg', frame)
         cv2.waitKey(1)
     cv2.destroyAllWindows()
 
@@ -276,7 +277,7 @@ def INFERENCE_PIPELINE_WRAPPER(inner_pipeline, bypass_max_size_buffers=20, name=
 
     return inference_wrapper_pipeline
 
-def DISPLAY_PIPELINE(video_sink='xvimagesink', sync='true', show_fps='false', name='hailo_display'):
+def DISPLAY_PIPELINE(video_sink='xvimagesink', sync='true', show_fps=False, name='hailo_display'):
     """
     Creates a GStreamer pipeline string for displaying the video.
     It includes the hailooverlay plugin to draw bounding boxes and labels on the video.
@@ -359,14 +360,14 @@ class GStreamerApp:
         user_data.use_frame = self.options_menu.use_frame
 
         self.sync = "false" if (self.options_menu.disable_sync or self.source_type != "file") else "true"
-        self.show_fps = "true" if self.options_menu.show_fps else "false"
+        self.show_fps = False if self.options_menu.show_fps else "false"
 
         if self.options_menu.dump_dot:
             os.environ["GST_DEBUG_DUMP_DOT_DIR"] = self.current_path
 
     def on_fps_measurement(self, sink, fps, droprate, avgfps):
-        print(f"FPS: {fps:.2f}, Droprate: {droprate:.2f}, Avg FPS: {avgfps:.2f}")
-        return True
+       # print(f"FPS: {fps:.2f}, Droprate: {droprate:.2f}, Avg FPS: {avgfps:.2f}")
+        return False
 
     def create_pipeline(self):
         # Initialize GStreamer
